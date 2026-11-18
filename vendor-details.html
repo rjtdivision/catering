@@ -702,7 +702,8 @@
   const nameInput = document.getElementById('name');
   const mobileInput = document.getElementById('mobile');
   const bloodGroupSelect = document.getElementById('bloodGroup');
-  const lockableFields = [nameInput, designationSelect, mobileInput, bloodGroupSelect];
+  // ID NO. is now entered manually, so it unlocks together with the other fields after the Aadhar check.
+  const lockableFields = [nameInput, idNo, designationSelect, mobileInput, bloodGroupSelect];
 
   // ================= Aadhar-first lock state =================
   // Every other field stays disabled until a full 12-digit Aadhar has been entered
@@ -805,7 +806,6 @@
       }
       aadharUnlocked = true;
       applyFieldLockState();
-      updateIdNo();
     } finally {
       aadharCheckInProgress = false;
     }
@@ -820,7 +820,6 @@
       unitInput.disabled = true;
       applyFieldLockState();
     }
-    updateIdNo();
     if(aadharInput.value.length === 12){
       runAadharCheck(aadharInput.value);
     }
@@ -934,21 +933,14 @@
     pendingRecordCheck = null;
   });
 
-  // ID No. = STATION + last 4 digits of Aadhar Card No. (e.g. Aadhar …7066, Station JAM -> JAM7066)
-  function previewNextId(station){
-    if(!station) return '';
-    const aadharDigits = aadharInput.value.replace(/[^0-9]/g, '');
-    if(aadharDigits.length < 4) return '';
-    return station + aadharDigits.slice(-4);
-  }
-
-  function updateIdNo(){
-    idNo.value = stationSelect.value ? previewNextId(stationSelect.value) : '';
-  }
+  // ID NO. is entered manually by the user (no auto-generation).
+  // Only capital letters, digits, dash and slash are allowed.
+  idNo.addEventListener('input', () => {
+    idNo.value = idNo.value.toUpperCase().replace(/[^A-Z0-9\-\/]/g, '');
+  });
 
   stationSelect.addEventListener('change', () => {
     refreshUnitOptionsForStation(stationSelect.value, '');
-    updateIdNo();
   });
 
   // Kick off the live catering-unit fetch (falls back to built-in lists on failure).
@@ -1145,7 +1137,7 @@
     html += rvRow('MOBILE NO.','मोबाइल नंबर', val('mobile') || 'NOT FILLED / भरा नहीं', checkMissing(val('mobile')));
     html += rvRow('BLOOD GROUP','रक्त समूह', val('bloodGroup') || 'NOT SELECTED / चयनित नहीं', checkMissing(val('bloodGroup')));
     html += rvRow('AADHAR CARD NO.','आधार कार्ड नंबर', val('aadhar') || 'NOT FILLED / भरा नहीं', checkMissing(val('aadhar')));
-    html += rvRow('ID NO.','आईडी नंबर', val('idNo') || previewNextId(stationSelect.value) || '--', false);
+    html += rvRow('ID NO.','आईडी नंबर', val('idNo') || 'NOT FILLED / भरा नहीं', checkMissing(val('idNo')));
 
     html += '<div class="rv-group-title">IDENTITY DOCUMENTS / पहचान दस्तावेज़</div>';
     html += rvFileRow('PASSPORT PHOTO','फोटो','fPhoto', existingDocUrl('photo'));
@@ -1198,6 +1190,11 @@
       showToast('PLEASE WAIT FOR THE AADHAR CHECK TO FINISH / कृपया आधार जांच पूरी होने तक प्रतीक्षा करें', true);
       return;
     }
+    if(!val('idNo')){
+      showToast('PLEASE ENTER ID NO. / कृपया आईडी नंबर दर्ज करें', true);
+      idNo.focus();
+      return;
+    }
 
     submitInProgress = true;
     mainSubmitBtn.disabled = true;
@@ -1241,6 +1238,11 @@
     });
   }
 
+  // Makes the manually-entered ID safe to use inside a file name.
+  function safeFileId(id){
+    return String(id || '').replace(/[^A-Z0-9\-]/gi, '-');
+  }
+
   async function buildUploadPayload(assignedId, pdfBlob){
     const fileFields = [
       ['fPhoto','photo'],
@@ -1279,7 +1281,7 @@
       aadhar: val('aadhar'),
       formData: formData,
       files: files,
-      pdf: { filename: 'vendor-details-' + assignedId + '.pdf', base64: pdfBase64 }
+      pdf: { filename: 'vendor-details-' + safeFileId(assignedId) + '.pdf', base64: pdfBase64 }
     };
   }
 
@@ -1527,7 +1529,7 @@
       ['MOBILE NO.', 'मोबाइल नंबर', val('mobile') || '-'],
       ['BLOOD GROUP', 'रक्त समूह', val('bloodGroup') || '-'],
       ['AADHAR CARD NO.', 'आधार कार्ड नंबर', val('aadhar') || '-'],
-      ['ID NO.', 'आईडी नंबर', val('idNo') || previewNextId(val('station')) || '-']
+      ['ID NO.', 'आईडी नंबर', val('idNo') || '-']
     ];
 
     // ---- Professional details table (FIELD / DETAILS) ----
@@ -1671,25 +1673,14 @@
     aadharUnlocked = false;
     lastCheckedAadhar = '';
     applyFieldLockState();
-    updateIdNo();
   }
 
   btnConfirm.addEventListener('click', async function(){
     btnConfirm.disabled = true;
     btnConfirm.textContent = 'GENERATING…';
 
-    // Assign the ID number — reuse the existing ID when updating a record, otherwise
-    // it's STATION + last 4 digits of Aadhar Card No. (e.g. JAM7066).
-    const station = stationSelect.value;
-    let assignedId = idNo.value || '--';
-    const updatingExisting = isEditMode && val('aadhar') === editingAadhar && existingRecord;
-    if(updatingExisting && existingRecord.idNo){
-      assignedId = existingRecord.idNo;
-      idNo.value = assignedId;
-    } else if(station){
-      assignedId = previewNextId(station) || assignedId;
-      idNo.value = assignedId;
-    }
+    // ID NO. is whatever the user typed manually.
+    const assignedId = val('idNo') || '--';
 
     closeModal();
     pdfOverlay.classList.add('show');
@@ -1704,7 +1695,7 @@
 
       btnViewPdf.href = currentPdfUrl;
       btnDownloadPdf.href = currentPdfUrl;
-      btnDownloadPdf.download = 'vendor-details-' + assignedId + '.pdf';
+      btnDownloadPdf.download = 'vendor-details-' + safeFileId(assignedId) + '.pdf';
       qrImage.src = genResult.qrImgUrl || '';
       qrAadhar.textContent = genResult.aadhar ? ('AADHAR: ' + genResult.aadhar) : '';
 
@@ -1755,8 +1746,6 @@
     printFrame.src = 'about:blank';
     resetFormAfterSubmit();
   });
-
-  updateIdNo();
 
   // ================= Auto-fit to single mobile screen =================
   const fitStage = document.getElementById('fitStage');
