@@ -18,6 +18,10 @@
  *     Catering Unit / Station) used to populate the STATION and NAME OF
  *     UNIT dropdowns on vendor-details.html, and the table + add/edit
  *     overlay on catering-unit.html.
+ *   - Manages the separate "inspector_list" master list (Sr. No. / Name /
+ *     Designation / Station / Display) used to populate the NAME OF
+ *     INSPECTING OFFICIAL dropdown on inspection.html, and lets any
+ *     inspector add / edit / delete themselves from that page.
  *
  * ---- SETUP ----
  * 1. Go to https://script.google.com and create a New Project.
@@ -30,9 +34,10 @@
  *      - Who has access: "Anyone"
  *    Click Deploy, and authorize the requested Drive/Sheets permissions.
  * 5. Copy the "Web app URL" you get after deploying.
- * 6. Open vendor-details.html, vendor-list.html and catering-unit.html and
- *    paste that URL into the APPS_SCRIPT_URL constant near the top of each
- *    <script> section (it must be the SAME URL in all three files).
+ * 6. Open vendor-details.html, vendor-list.html, catering-unit.html and
+ *    inspection.html and paste that URL into the APPS_SCRIPT_URL constant
+ *    near the top of each <script> section (it must be the SAME URL in
+ *    all files).
  * 7. Whenever you edit this script, use Deploy > Manage deployments >
  *    Edit (pencil icon) > New version, so the same URL picks up changes.
  *
@@ -60,6 +65,13 @@ var DRIVE_FOLDER_ID = '186VQZH294gSTpl3VaNajAoraGseBM0Et';
 // Columns: A = Sr. No. (auto-incrementing), B = Name of Catering Unit, C = Station
 var CATERING_UNIT_SHEET_NAME = 'catering_unit';
 var CATERING_UNIT_HEADERS = ['Sr. No.', 'Name of Catering Unit', 'Station'];
+
+// ---- Inspector master list (used by inspection.html's dropdown) ----
+// Columns: A = Sr. No., B = Name, C = Designation, D = Station,
+//          E = Display ("{NAME}, {DESIGNATION} - {STATION}") — this is
+//          what inspection.html's dropdown actually reads and shows.
+var INSPECTOR_SHEET_NAME = 'inspector_list';
+var INSPECTOR_HEADERS = ['Sr. No.', 'Name', 'Designation', 'Station', 'Display'];
 
 /** Strips everything except digits/letters, so "726655977066" and a Sheets-auto-converted
  *  number in the same cell always compare equal — this is what stops duplicate rows.
@@ -122,6 +134,17 @@ function doPost(e) {
     }
     if (data.action === 'updateCateringUnit') {
       return doPost_updateCateringUnit(data);
+    }
+
+    // ---- Inspector "add / edit / delete" — separate simple sheet, handled first ----
+    if (data.action === 'addInspector') {
+      return doPost_addInspector(data);
+    }
+    if (data.action === 'updateInspector') {
+      return doPost_updateInspector(data);
+    }
+    if (data.action === 'deleteInspector') {
+      return doPost_deleteInspector(data);
     }
 
     var aadhar = normalizeAadhar(data.aadhar);
@@ -237,7 +260,9 @@ function doPost(e) {
     var formData = data.formData || {};
     for (var key in formData) { record[key] = formData[key]; }
     record.aadhar = aadhar;
-    record.idNo = (previousRecord && previousRecord.idNo) ? previousRecord.idNo : (formData.idNo || '');
+    // ID NO. is entered manually on the form — the value submitted now always wins;
+    // the previously-saved ID is only a fallback if none was sent.
+    record.idNo = formData.idNo || (previousRecord && previousRecord.idNo) || '';
     record.documents = docLinks;
     record.pdfReport = pdfLink;
     record.qrCode = qrLink;
@@ -371,6 +396,150 @@ function doPost_updateCateringUnit(data) {
 }
 
 /**
+ * POST body: { action: 'addInspector', name: '...', designation: '...', station: '...' }
+ * Appends a new row to the separate 'inspector_list' sheet: auto-incrementing
+ * Sr. No. in A, Name in B, Designation in C, Station in D, and a combined
+ * "{NAME}, {DESIGNATION} - {STATION}" display string in E — E is what
+ * inspection.html's "Name of Inspecting Official" dropdown actually reads.
+ * Uses its own lock so two near-simultaneous adds can never compute the
+ * same Sr. No.
+ */
+function doPost_addInspector(data) {
+  var inspLock = LockService.getScriptLock();
+  try {
+    var name = String(data.name || '').trim();
+    var designation = String(data.designation || '').trim();
+    var station = String(data.station || '').trim();
+    if (!name) throw new Error('Name is required.');
+    if (!designation) throw new Error('Designation is required.');
+    if (!station) throw new Error('Station is required.');
+
+    inspLock.waitLock(30000);
+
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName(INSPECTOR_SHEET_NAME);
+    if (!sheet) {
+      sheet = ss.insertSheet(INSPECTOR_SHEET_NAME);
+      sheet.appendRow(INSPECTOR_HEADERS);
+    }
+    var lastRow = sheet.getLastRow();
+    var srNo = lastRow >= 2 ? (lastRow - 1 + 1) : 1; // count of existing data rows + 1
+    var display = name + ', ' + designation + ' - ' + station;
+    sheet.appendRow([srNo, name, designation, station, display]);
+
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: true,
+        inspector: { srNo: srNo, name: name, designation: designation, station: station, display: display }
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ success: false, error: err.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    try { inspLock.releaseLock(); } catch (releaseErr) { /* lock was never acquired — nothing to release */ }
+  }
+}
+
+/**
+ * POST body: { action: 'updateInspector', srNo: N, name: '...', designation: '...', station: '...' }
+ * Finds the row in 'inspector_list' whose Sr. No. (column A) equals srNo and
+ * overwrites Name / Designation / Station in place, recomputing the Display
+ * string (column E) to match — used by inspection.html's Edit button. Sr.
+ * No. itself never changes. Uses its own lock so an edit can never race a
+ * concurrent add/delete.
+ */
+function doPost_updateInspector(data) {
+  var inspLock = LockService.getScriptLock();
+  try {
+    var srNo = parseInt(data.srNo, 10);
+    var name = String(data.name || '').trim();
+    var designation = String(data.designation || '').trim();
+    var station = String(data.station || '').trim();
+    if (!srNo || isNaN(srNo)) throw new Error('Missing or invalid record to update.');
+    if (!name) throw new Error('Name is required.');
+    if (!designation) throw new Error('Designation is required.');
+    if (!station) throw new Error('Station is required.');
+
+    inspLock.waitLock(30000);
+
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName(INSPECTOR_SHEET_NAME);
+    if (!sheet) throw new Error('Inspector list not found.');
+
+    var lastRow = sheet.getLastRow();
+    var rowIndex = -1;
+    if (lastRow >= 2) {
+      var srCol = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+      for (var r = 0; r < srCol.length; r++) {
+        if (parseInt(srCol[r][0], 10) === srNo) { rowIndex = r + 2; break; }
+      }
+    }
+    if (rowIndex === -1) throw new Error('Record not found — it may have been removed.');
+
+    var display = name + ', ' + designation + ' - ' + station;
+    sheet.getRange(rowIndex, 2, 1, 4).setValues([[name, designation, station, display]]);
+
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: true,
+        inspector: { srNo: srNo, name: name, designation: designation, station: station, display: display }
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ success: false, error: err.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    try { inspLock.releaseLock(); } catch (releaseErr) { /* lock was never acquired — nothing to release */ }
+  }
+}
+
+/**
+ * POST body: { action: 'deleteInspector', srNo: N }
+ * Deletes the row in 'inspector_list' whose Sr. No. (column A) equals srNo —
+ * used by inspection.html's Delete button. Other Sr. No. values are left
+ * untouched (no renumbering). Uses its own lock so a delete can never race
+ * a concurrent add/edit.
+ */
+function doPost_deleteInspector(data) {
+  var inspLock = LockService.getScriptLock();
+  try {
+    var srNo = parseInt(data.srNo, 10);
+    if (!srNo || isNaN(srNo)) throw new Error('Missing or invalid record to delete.');
+
+    inspLock.waitLock(30000);
+
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName(INSPECTOR_SHEET_NAME);
+    if (!sheet) throw new Error('Inspector list not found.');
+
+    var lastRow = sheet.getLastRow();
+    var rowIndex = -1;
+    if (lastRow >= 2) {
+      var srCol = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+      for (var r = 0; r < srCol.length; r++) {
+        if (parseInt(srCol[r][0], 10) === srNo) { rowIndex = r + 2; break; }
+      }
+    }
+    if (rowIndex === -1) throw new Error('Record not found — it may have already been removed.');
+
+    sheet.deleteRow(rowIndex);
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ success: true, srNo: srNo }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ success: false, error: err.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    try { inspLock.releaseLock(); } catch (releaseErr) { /* lock was never acquired — nothing to release */ }
+  }
+}
+
+/**
  * GET /exec?catUnits=1
  * Returns every row of the 'catering_unit' sheet as a JSON array of
  * { srNo, name, station }, for the Catering Unit tab's table, and for the
@@ -400,6 +569,51 @@ function doGet_listCateringUnits() {
   } catch (err) {
     return ContentService
       .createTextOutput(JSON.stringify({ success: false, error: err.message, units: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * GET /exec?inspectors=1
+ * Returns every row of the 'inspector_list' sheet as a JSON array of
+ * { srNo, name, designation, station, display } — inspection.html's "Name
+ * of Inspecting Official" dropdown shows/submits `display`, and uses
+ * `srNo` + the other fields to power the Edit/Delete buttons.
+ */
+function doGet_listInspectors() {
+  try {
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName(INSPECTOR_SHEET_NAME);
+    var inspectors = [];
+    if (sheet) {
+      var lastRow = sheet.getLastRow();
+      if (lastRow >= 2) {
+        var values = sheet.getRange(2, 1, lastRow - 1, 5).getValues(); // columns A:E
+        for (var i = 0; i < values.length; i++) {
+          var name = String(values[i][1] || '').trim();
+          var designation = String(values[i][2] || '').trim();
+          var station = String(values[i][3] || '').trim();
+          var display = String(values[i][4] || '').trim();
+          if (!display && name) {
+            display = name + (designation ? ', ' + designation : '') + (station ? ' - ' + station : '');
+          }
+          if (!display) continue;
+          inspectors.push({
+            srNo: values[i][0],
+            name: name,
+            designation: designation,
+            station: station,
+            display: display
+          });
+        }
+      }
+    }
+    return ContentService
+      .createTextOutput(JSON.stringify({ success: true, inspectors: inspectors }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ success: false, error: err.message, inspectors: [] }))
       .setMimeType(ContentService.MimeType.JSON);
   }
 }
@@ -507,6 +721,7 @@ function doGet(e) {
   var fetchDocsParam = e && e.parameter ? e.parameter.fetchDocs : null;
   var listParam = e && e.parameter ? e.parameter.list : null;
   var catUnitsParam = e && e.parameter ? e.parameter.catUnits : null;
+  var inspectorsParam = e && e.parameter ? e.parameter.inspectors : null;
 
   if (listParam) {
     return doGet_listAll();
@@ -514,6 +729,10 @@ function doGet(e) {
 
   if (catUnitsParam) {
     return doGet_listCateringUnits();
+  }
+
+  if (inspectorsParam) {
+    return doGet_listInspectors();
   }
 
   if (fetchDocsParam && aadharParam) {
@@ -617,7 +836,7 @@ function doGet(e) {
     }
   }
   return ContentService
-    .createTextOutput(JSON.stringify({ status: 'Catering Vendor Backend is running.', version: 'v3-unit-dropdowns-edit' }))
+    .createTextOutput(JSON.stringify({ status: 'Catering Vendor Backend is running.', version: 'v6-manual-id' }))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
